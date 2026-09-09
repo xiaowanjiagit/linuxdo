@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Syntax check & unit tests (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Required project files
+        run: |
+          test -f README.md
+          test -f LICENSE
+
+      - name: Syntax check all tracked JS
+        run: |
+          set -e
+          for f in $(git ls-files '*.js'); do
+            node --check "$f"
+          done
+
+      - name: Unit tests (node --test)
+        run: npm test

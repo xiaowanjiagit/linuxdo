@@ -1,0 +1,10 @@
+{
+  "name": "linuxdo-automation",
+  "version": "2.5.0",
+  "description": "Linux.do auto-browsing userscript — pure helpers are unit-tested with the Node built-in test runner.",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1851,17 +1851,30 @@
     }
   }
 
-  // ==================== 启动 ====================
-  installTimingsHook();
-  const automation = new LinuxDoAutomation();
-  automation.init();
+  // ==================== 启动（仅浏览器） ====================
+  // Node 环境（单元测试）无 window/DOM，跳过启动逻辑，只导出纯函数供测试。
+  if (typeof window !== 'undefined') {
+    installTimingsHook();
+    const automation = new LinuxDoAutomation();
+    automation.init();
 
-  // 页面卸载时把节流未落盘的浏览记录 flush 掉，避免翻页时丢失最后几条记录
-  // flushPending 只在确有待写数据时才写，路过/未登录页面不会触发，避免空数据覆盖历史
-  // 注意：这里不再释放防多开锁——脚本自身翻页也会触发 beforeunload，会导致锁在每次
-  // 跳转间隙被误释放；锁改为依赖 15 秒心跳超时自然失效，手动停止时由 stop() 主动释放
-  window.addEventListener('beforeunload', () => {
-    automation.history.flushPending();
-  });
+    // 页面卸载时把节流未落盘的浏览记录 flush 掉，避免翻页时丢失最后几条记录
+    // flushPending 只在确有待写数据时才写，路过/未登录页面不会触发，避免空数据覆盖历史
+    // 注意：这里不再释放防多开锁——脚本自身翻页也会触发 beforeunload，会导致锁在每次
+    // 跳转间隙被误释放；锁改为依赖 15 秒心跳超时自然失效，手动停止时由 stop() 主动释放
+    window.addEventListener('beforeunload', () => {
+      automation.history.flushPending();
+    });
+  }
 
+  // ==================== Node 测试导出 ====================
+  // 仅在 Node（package.json 测试）环境生效；浏览器里 module 未定义，直接跳过。
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      getPageTypeFromPath,
+      getTopicIdFromUrl,
+      trimSet,
+      randomInt,
+    };
+  }
 })();

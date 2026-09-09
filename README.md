@@ -48,6 +48,16 @@ linuxdo/
 - **视觉标记** - 已浏览话题显示绿色勾号，透明度降低
 - **配置灵活** - 所有参数可调整
 
+## 测试
+
+油猴脚本主体在浏览器运行，仓库用 Node 内置测试器对纯函数（路径分类、话题 ID 提取、历史记录裁剪等）做单元测试：
+
+```bash
+npm test        # node --test，无需安装依赖
+```
+
+CI（`.github/workflows/ci.yml`）对所有跟踪的 JS 做 `node --check` 语法检查并跑单元测试。
+
 ## 快速开始
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展
