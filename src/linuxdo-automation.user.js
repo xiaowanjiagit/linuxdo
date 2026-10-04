@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Linux.do 自动浏览助手
 // @namespace    https://linux.do/
-// @version      2.4.2
-// @description  自动浏览帖子、滚动查看所有回复、随机点赞、避免重复浏览、可限定每帖浏览楼层数
+// @version      2.5.0
+// @description  自动浏览帖子、滚动查看所有回复、随机点赞、避免重复浏览、可限定每帖浏览楼层数、Credit积分展示
 // @author       Assistant
 // @match        https://linux.do/*
 // @downloadURL  https://raw.githubusercontent.com/liasica/linuxdo/feature/src/linuxdo-automation.user.js
@@ -10,7 +10,9 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      credit.linux.do
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -584,6 +586,117 @@
       });
     };
   }
+
+  // ==================== Credit 积分查询 ====================
+
+  // 从 credit.linux.do 拉取 Credit（LDC）余额与每日收支，展示在控制面板。
+  // 认证依赖浏览器里 credit.linux.do 的 OAuth cookie（用户登录过 https://credit.linux.do 即可用），
+  // 因此必须走 GM_xmlhttpRequest（携带该域 cookie），页面内 fetch 是 linux.do 域、带不过去。
+  // 命中 429 时进入冷却期，冷却结束前直接用缓存，避免反复触发风控。
+  const CREDIT_MIN_INTERVAL = 5 * 60 * 1000;   // 常规刷新最小间隔：5 分钟
+  const CREDIT_COOLDOWN_429 = 30 * 60 * 1000;  // 触发 429 后的冷却期：30 分钟
+
+  class CreditTracker {
+    constructor() {
+      // 刷新节流状态持久化，跨页面跳转（脚本随 Discourse 整页导航重新注入）依然生效
+      this.lastFetch = Storage.get('credit_last_fetch', 0);
+      this.cooldownUntil = Storage.get('credit_cooldown_until', 0);
+      this.cachedData = Storage.get('credit_cache', null);
+      this.fetching = false;
+    }
+
+    // 拉取并返回数据；任何失败路径都 resolve(null)，由调用方决定回退展示
+    fetch(force = false) {
+      const now = Date.now();
+      if (this.fetching) return Promise.resolve(this.cachedData);
+      if (!force && this.cooldownUntil > now) return Promise.resolve(this.cachedData);
+      if (!force && this.lastFetch > 0 && now - this.lastFetch < CREDIT_MIN_INTERVAL) {
+        return Promise.resolve(this.cachedData);
+      }
+
+      this.fetching = true;
+      return this.requestUserInfo()
+        .then(userData => {
+          if (!userData) return this.cachedData;
+          this.lastFetch = now;
+          this.cooldownUntil = 0;
+          this.cachedData = {
+            username: userData.nickname || userData.username || '',
+            available: userData.available_balance ?? '0',
+            community: userData.community_balance ?? '0',
+            remainQuota: userData.remain_quota ?? '0',
+            totalReceive: userData.total_receive ?? '0',
+            totalPayment: userData.total_payment ?? '0',
+            fetchTime: now
+          };
+          Storage.set('credit_cache', this.cachedData);
+          Storage.set('credit_last_fetch', now);
+          Storage.set('credit_cooldown_until', 0);
+          return this.cachedData;
+        })
+        .catch(err => {
+          log('[Credit] 拉取失败:', err?.message || err);
+          if (err?.rateLimited) {
+            this.cooldownUntil = now + CREDIT_COOLDOWN_429;
+            Storage.set('credit_cooldown_until', this.cooldownUntil);
+          }
+          return this.cachedData;
+        })
+        .finally(() => { this.fetching = false; });
+    }
+
+    // credit.linux.do 的 OAuth 用户信息接口；401/403 表示未登录 credit 站
+    requestUserInfo() {
+      return new Promise((resolve, reject) => {
+        if (typeof GM_xmlhttpRequest === 'undefined') {
+          reject(new Error('GM_xmlhttpRequest 不可用'));
+          return;
+        }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: 'https://credit.linux.do/api/v1/oauth/user-info',
+          timeout: 15000,
+          headers: {
+            'Accept': 'application/json',
+            'Referer': 'https://credit.linux.do/home',
+            'Origin': 'https://credit.linux.do'
+          },
+          onload: (response) => {
+            if (response.status === 200) {
+              try {
+                const json = JSON.parse(response.responseText);
+                resolve(json?.data || null);
+              } catch (e) {
+                reject(new Error('响应解析失败'));
+              }
+            } else if (response.status === 401 || response.status === 403) {
+              // 未登录 credit 站不算错误，静默返回 null（面板显示"未绑定"）
+              resolve(null);
+            } else if (response.status === 429) {
+              const err = new Error('rate limited');
+              err.rateLimited = true;
+              reject(err);
+            } else {
+              reject(new Error(`HTTP ${response.status}`));
+            }
+          },
+          onerror: () => reject(new Error('网络错误')),
+          ontimeout: () => reject(new Error('请求超时'))
+        });
+      });
+    }
+
+    // 格式化余额显示：大数缩写（12.3k），保持面板紧凑
+    static formatAmount(value) {
+      const num = parseFloat(value);
+      if (isNaN(num)) return String(value ?? '0');
+      if (Math.abs(num) >= 100000) return (num / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+      return String(Math.round(num * 100) / 100);
+    }
+  }
+
+  // 懒加载单例：仅在面板展开（createControlPanel）后才会真正发请求
+  let creditTracker = null;
 
   // ==================== 滚动控制器 ====================
 
@@ -1325,6 +1438,33 @@
         #linuxdo-auto-panel .status-indicator.running { background: #22c55e; animation: pulse 1.5s infinite; }
         #linuxdo-auto-panel .status-indicator.stopped { background: #f87171; }
 
+        /* Credit 积分区 */
+        #linuxdo-auto-panel .credit-section { margin-top: 8px; padding: 9px 12px; background: rgba(0,0,0,0.14); border-radius: 10px; }
+        #linuxdo-auto-panel .credit-header {
+          display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;
+          font-size: 12px; color: rgba(255,255,255,0.68);
+        }
+        #linuxdo-auto-panel .credit-refresh {
+          border: 0; padding: 2px 8px; border-radius: 6px; cursor: pointer;
+          background: rgba(255,255,255,0.16); color: #fff; font-size: 10px; font-family: inherit;
+          transition: background .15s;
+        }
+        #linuxdo-auto-panel .credit-refresh:hover { background: rgba(255,255,255,0.3); }
+        #linuxdo-auto-panel .credit-refresh:disabled { opacity: .5; cursor: default; }
+        #linuxdo-auto-panel .credit-main {
+          display: flex; justify-content: space-between; align-items: baseline; margin: 4px 0;
+          font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+        }
+        #linuxdo-auto-panel .credit-sub { display: flex; justify-content: space-between; margin: 3px 0; font-size: 11px; }
+        #linuxdo-auto-panel .credit-sub .stats-label { color: rgba(255,255,255,0.6); }
+        #linuxdo-auto-panel .credit-sub .stats-value { font-weight: 500; }
+        #linuxdo-auto-panel .credit-link {
+          display: inline-block; margin-top: 5px; font-size: 10px;
+          color: rgba(255,255,255,0.62); text-decoration: none;
+        }
+        #linuxdo-auto-panel .credit-link:hover { color: #fff; text-decoration: underline; }
+        #linuxdo-auto-panel .credit-status { font-size: 10px; color: rgba(255,255,255,0.55); }
+
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
         .auto-viewed { opacity: 0.6; }
       `;
@@ -1388,6 +1528,14 @@
             <div class="stats-row"><span class="stats-label">本次点赞</span><span class="stats-value" id="session-liked">0</span></div>
             <div class="stats-row"><span class="stats-label">本次总阅读量</span><span class="stats-value" id="session-read-count">0</span></div>
           </div>
+          <div class="credit-section" id="credit-section">
+            <div class="credit-header">
+              <span>💰 Credit (LDC)</span>
+              <button class="credit-refresh" id="btn-credit-refresh" title="立即刷新（频繁刷新会被 credit 站限流）">刷新</button>
+            </div>
+            <div id="credit-body"><div class="credit-status">加载中...</div></div>
+            <a class="credit-link" href="https://credit.linux.do/home" target="_blank" rel="noopener">查看明细 →</a>
+          </div>
         </div>
       `;
       document.body.appendChild(panel);
@@ -1441,6 +1589,55 @@
       floorCheck.addEventListener('change', (e) => setFloorLimitUnreadOnly(e.target.checked));
 
       document.getElementById('page-type').textContent = getPageType();
+
+      // Credit 积分区：懒初始化 + 立即展示缓存 + 按节流策略拉新
+      if (!creditTracker) creditTracker = new CreditTracker();
+      this.renderCredit(creditTracker.cachedData, 'cache');
+      creditTracker.fetch().then(data => this.renderCredit(data, 'fetch'));
+      document.getElementById('btn-credit-refresh').addEventListener('click', () => this.refreshCredit());
+    }
+
+    // 渲染 Credit 区。state: 'cache' | 'fetch' | 'refresh'，用于状态行文案
+    // 安全说明：所有插入 innerHTML 的动态值均来自 CreditTracker.formatAmount（纯数字格式化输出）
+    // 或下方 escapeHtml 转义后的字符串，不存在未转义的外部数据
+    renderCredit(data, state = 'fetch') {
+      const body = document.getElementById('credit-body');
+      const refreshBtn = document.getElementById('btn-credit-refresh');
+      if (!body) return;
+      if (refreshBtn) refreshBtn.disabled = false;
+
+      if (!data) {
+        const now = Date.now();
+        if (creditTracker?.cooldownUntil > now) {
+          const mins = Math.ceil((creditTracker.cooldownUntil - now) / 60000);
+          body.innerHTML = `<div class="credit-status">限流冷却中，约 ${mins} 分钟后可刷新</div>`;
+        } else {
+          body.innerHTML = `<div class="credit-status">未获取到（需先登录 <a href="https://credit.linux.do/home" target="_blank" rel="noopener" style="color:inherit;">credit.linux.do</a>）</div>`;
+        }
+        return;
+      }
+
+      const timeStr = new Date(data.fetchTime).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      const stateText = state === 'cache' ? `缓存 ${timeStr}` : `${timeStr}`;
+      body.innerHTML = `
+        <div class="credit-main"><span>可用余额</span><span>${CreditTracker.formatAmount(data.available)}</span></div>
+        <div class="credit-sub"><span class="stats-label">社区积分</span><span class="stats-value">${CreditTracker.formatAmount(data.community)}</span></div>
+        <div class="credit-sub"><span class="stats-label">今日剩余额度</span><span class="stats-value">${CreditTracker.formatAmount(data.remainQuota)}</span></div>
+        <div class="credit-sub"><span class="stats-label">累计收支</span><span class="stats-value">+${CreditTracker.formatAmount(data.totalReceive)} / -${CreditTracker.formatAmount(data.totalPayment)}</span></div>
+        <div class="credit-status">更新于 ${stateText}</div>
+      `;
+    }
+
+    // 手动刷新：绕过 5 分钟节流（429 冷却期内仍拒绝），按钮置灰防连点
+    async refreshCredit() {
+      const refreshBtn = document.getElementById('btn-credit-refresh');
+      if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = '刷新中...';
+      }
+      const data = await creditTracker.fetch(true);
+      this.renderCredit(data, 'refresh');
+      if (refreshBtn) refreshBtn.textContent = '刷新';
     }
 
     // 拖动：手柄是标题栏（收起态下它就是整个悬浮球），松手后记住位置
@@ -1654,17 +1851,30 @@
     }
   }
 
-  // ==================== 启动 ====================
-  installTimingsHook();
-  const automation = new LinuxDoAutomation();
-  automation.init();
+  // ==================== 启动（仅浏览器） ====================
+  // Node 环境（单元测试）无 window/DOM，跳过启动逻辑，只导出纯函数供测试。
+  if (typeof window !== 'undefined') {
+    installTimingsHook();
+    const automation = new LinuxDoAutomation();
+    automation.init();
 
-  // 页面卸载时把节流未落盘的浏览记录 flush 掉，避免翻页时丢失最后几条记录
-  // flushPending 只在确有待写数据时才写，路过/未登录页面不会触发，避免空数据覆盖历史
-  // 注意：这里不再释放防多开锁——脚本自身翻页也会触发 beforeunload，会导致锁在每次
-  // 跳转间隙被误释放；锁改为依赖 15 秒心跳超时自然失效，手动停止时由 stop() 主动释放
-  window.addEventListener('beforeunload', () => {
-    automation.history.flushPending();
-  });
+    // 页面卸载时把节流未落盘的浏览记录 flush 掉，避免翻页时丢失最后几条记录
+    // flushPending 只在确有待写数据时才写，路过/未登录页面不会触发，避免空数据覆盖历史
+    // 注意：这里不再释放防多开锁——脚本自身翻页也会触发 beforeunload，会导致锁在每次
+    // 跳转间隙被误释放；锁改为依赖 15 秒心跳超时自然失效，手动停止时由 stop() 主动释放
+    window.addEventListener('beforeunload', () => {
+      automation.history.flushPending();
+    });
+  }
 
+  // ==================== Node 测试导出 ====================
+  // 仅在 Node（package.json 测试）环境生效；浏览器里 module 未定义，直接跳过。
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      getPageTypeFromPath,
+      getTopicIdFromUrl,
+      trimSet,
+      randomInt,
+    };
+  }
 })();
